@@ -4,6 +4,8 @@
 
 ## Build generated
 build/
+.build/
+__pycache__/
 DerivedData
 
 ## Various settings

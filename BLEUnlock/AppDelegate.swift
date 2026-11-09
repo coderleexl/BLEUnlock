@@ -30,6 +30,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenuItemVa
     var unlockedAt = 0.0
     var inScreensaver = false
     var lastRSSI: Int? = nil
+    var diagnosticSelectionScheduled = false
 
     func menuWillOpen(_ menu: NSMenu) {
         if menu == deviceMenu {
@@ -101,6 +102,19 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenuItemVa
         if (device.uuid == ble.monitoredUUID) {
             menuItem.state = .on
         }
+        if DiagnosticLog.matchesWatch(peripheralName: device.peripheral?.name, advertisedName: device.advertisedName),
+           !diagnosticSelectionScheduled {
+            diagnosticSelectionScheduled = true
+            DiagnosticLog.event("diagnostic_selection_scheduled", ["uuid": device.uuid.uuidString,
+                "delay_seconds": 1.5])
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                DiagnosticLog.event("diagnostic_selection", ["uuid": device.uuid.uuidString,
+                    "state_before_selection": device.peripheral?.state.rawValue ?? -1,
+                    "note": "Controlled reproduction; selection is not saved to preferences."])
+                self.monitorDevice(uuid: device.uuid)
+                self.ble.stopScanning()
+            }
+        }
     }
     
     func updateDevice(device: Device) {
@@ -165,6 +179,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenuItemVa
     }
 
     func runScript(_ arg: String) {
+        guard !DiagnosticLog.diagnosticsOnly else { DiagnosticLog.suppressed("event_script"); return }
         guard let directory = try? FileManager.default.url(for: .applicationScriptsDirectory, in: .userDomainMask, appropriateFor: nil, create: true) else { return }
         let file = directory.appendingPathComponent("event")
         let process = Process()
@@ -178,6 +193,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenuItemVa
     }
 
     func pauseNowPlaying() {
+        guard !DiagnosticLog.diagnosticsOnly else { DiagnosticLog.suppressed("pause_media"); return }
         guard prefs.bool(forKey: "pauseItunes") else { return }
         MRMediaRemoteGetNowPlayingApplicationIsPlaying(
             DispatchQueue.main,
@@ -192,6 +208,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenuItemVa
     }
     
     func playNowPlaying() {
+        guard !DiagnosticLog.diagnosticsOnly else { DiagnosticLog.suppressed("resume_media"); return }
         guard prefs.bool(forKey: "pauseItunes") else { return }
         if nowPlayingWasPlaying {
             print("play")
@@ -203,6 +220,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenuItemVa
     }
 
     func lockOrSaveScreen() {
+        guard !DiagnosticLog.diagnosticsOnly else { DiagnosticLog.suppressed("lock"); return }
         if prefs.bool(forKey: "screensaver") {
             NSWorkspace.shared.launchApplication("ScreenSaverEngine")
         } else {
@@ -217,6 +235,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenuItemVa
     }
 
     func updatePresence(presence: Bool, reason: String) {
+        DiagnosticLog.event("presence_changed", ["present": presence, "reason": reason])
+        guard !DiagnosticLog.diagnosticsOnly else { DiagnosticLog.suppressed("presence_action"); return }
         if presence {
             if ble.unlockRSSI != ble.UNLOCK_DISABLED {
                 if let un = userNotification {
@@ -245,6 +265,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenuItemVa
     }
 
     func fakeKeyStrokes(_ string: String) {
+        guard !DiagnosticLog.diagnosticsOnly else { DiagnosticLog.suppressed("keyboard_input"); return }
         let src = CGEventSource(stateID: .hidSystemState)
         // Send 20 characters per keyboard event. That seems to be the limit.
         let PER = 20
@@ -278,6 +299,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenuItemVa
     }
     
     func tryUnlockScreen() {
+        guard !DiagnosticLog.diagnosticsOnly else { DiagnosticLog.suppressed("unlock"); return }
         guard !manualLock else { return }
         guard ble.presence else { return }
         guard ble.unlockRSSI != ble.UNLOCK_DISABLED else { return }
@@ -340,6 +362,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenuItemVa
     }
 
     @objc func onUnlock() {
+        guard !DiagnosticLog.diagnosticsOnly else { DiagnosticLog.suppressed("screen_unlock_callback"); return }
         Timer.scheduledTimer(withTimeInterval: 2, repeats: false, block: { _ in
             print("onUnlock")
             if Date().timeIntervalSince1970 >= self.unlockedAt + 10 {
@@ -378,6 +401,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenuItemVa
     }
 
     func monitorDevice(uuid: UUID) {
+        DiagnosticLog.event("device_selected", ["uuid": uuid.uuidString])
         connected = false
         statusItem.button?.image = NSImage(named: "StatusBarDisconnected")
         monitorMenuItem?.title = t("not_detected")
@@ -413,6 +437,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenuItemVa
     }
 
     func fetchPassword(warn: Bool = false) -> String? {
+        guard !DiagnosticLog.diagnosticsOnly else { DiagnosticLog.suppressed("read_password"); return nil }
         let query: [String: Any] = [
             String(kSecClass): kSecClassGenericPassword,
             String(kSecAttrAccount): NSUserName(),
@@ -443,6 +468,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenuItemVa
     }
     
     @objc func askPassword() {
+        guard !DiagnosticLog.diagnosticsOnly else { DiagnosticLog.suppressed("password_prompt"); return }
         let msg = NSAlert()
         msg.addButton(withTitle: t("ok"))
         msg.addButton(withTitle: t("cancel"))
@@ -553,6 +579,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenuItemVa
     }
 
     @objc func lockNow() {
+        guard !DiagnosticLog.diagnosticsOnly else { DiagnosticLog.suppressed("manual_lock"); return }
         guard !isScreenLocked() else { return }
         manualLock = true
         pauseNowPlaying()
@@ -575,6 +602,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenuItemVa
     
     func constructMenu() {
         monitorMenuItem = mainMenu.addItem(withTitle: t("device_not_set"), action: nil, keyEquivalent: "")
+        if DiagnosticLog.diagnosticsOnly {
+            mainMenu.addItem(withTitle: "诊断模式：电脑锁定与解锁已暂停", action: nil, keyEquivalent: "")
+        }
         
         var item: NSMenuItem
 
@@ -662,6 +692,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenuItemVa
     }
 
     func checkAccessibility() {
+        guard !DiagnosticLog.diagnosticsOnly else { DiagnosticLog.suppressed("accessibility_setup"); return }
         let key = kAXTrustedCheckOptionPrompt.takeRetainedValue() as String
         if (!AXIsProcessTrustedWithOptions([key: true] as CFDictionary)) {
             // Sometimes Prompt option above doesn't work.
@@ -674,6 +705,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenuItemVa
     }
 
     func applicationDidFinishLaunching(_ aNotification: Notification) {
+        DiagnosticLog.event("app_started", ["source_commit": Bundle.main.object(forInfoDictionaryKey: "BLEUnlockSourceCommit") as? String ?? "",
+            "diagnostics_only": DiagnosticLog.diagnosticsOnly, "log_path": DiagnosticLog.path])
         if let button = statusItem.button {
             button.image = NSImage(named: "StatusBarDisconnected")
             constructMenu()
@@ -719,11 +752,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenuItemVa
         dnc.addObserver(self, selector: #selector(onScreensaverStart), name: NSNotification.Name(rawValue: "com.apple.screensaver.didstart"), object: nil)
         dnc.addObserver(self, selector: #selector(onScreensaverStop), name: NSNotification.Name(rawValue: "com.apple.screensaver.didstop"), object: nil)
 
-        if ble.unlockRSSI != ble.UNLOCK_DISABLED && !prefs.bool(forKey: "wakeWithoutUnlocking") && fetchPassword() == nil {
+        if !DiagnosticLog.diagnosticsOnly && ble.unlockRSSI != ble.UNLOCK_DISABLED && !prefs.bool(forKey: "wakeWithoutUnlocking") && fetchPassword() == nil {
             askPassword()
         }
         checkAccessibility()
-        checkUpdate()
+        if !DiagnosticLog.diagnosticsOnly { checkUpdate() }
+        if let watchName = DiagnosticLog.watchName {
+            DiagnosticLog.event("diagnostic_scenario_started", ["watch_name": watchName,
+                "scenario": "scan_list_connect_then_select", "desktop_actions": "suppressed"])
+            ble.startScanning()
+        }
 
         // Hide dock icon.
         // This is required because we can't have LSUIElement set to true in Info.plist,
@@ -732,5 +770,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenuItemVa
     }
     
     func applicationWillTerminate(_ aNotification: Notification) {
+        DiagnosticLog.event("app_terminated")
     }
 }

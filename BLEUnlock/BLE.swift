@@ -36,6 +36,7 @@ class Device: NSObject {
     var scanTimer: Timer?
     var macAddr: String?
     var blName: String?
+    var advertisedName: String?
     
     override var description: String {
         get {
@@ -142,16 +143,19 @@ class BLE: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
 
     func scanForPeripherals() {
         guard !centralMgr.isScanning else { return }
+        DiagnosticLog.event("scan_started", ["device_list_open": scanMode, "passive_mode": passiveMode])
         centralMgr.scanForPeripherals(withServices: nil, options: [CBCentralManagerScanOptionAllowDuplicatesKey: true])
         //print("Start scanning")
     }
 
     func startScanning() {
+        DiagnosticLog.event("device_list_opened")
         scanMode = true
         scanForPeripherals()
     }
 
     func stopScanning() {
+        DiagnosticLog.event("device_list_closed", ["active_timer": activeModeTimer != nil])
         scanMode = false
         if activeModeTimer != nil {
             centralMgr.stopScan()
@@ -159,11 +163,13 @@ class BLE: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
     }
 
     func setPassiveMode(_ mode: Bool) {
+        DiagnosticLog.event("passive_mode_set", ["enabled": mode])
         passiveMode = mode
         if passiveMode {
             activeModeTimer?.invalidate()
             activeModeTimer = nil
             if let p = monitoredPeripheral {
+                DiagnosticLog.event("cancel_connection", ["uuid": p.identifier.uuidString, "reason": "passive_mode_enabled"])
                 centralMgr.cancelPeripheralConnection(p)
             }
         }
@@ -171,7 +177,11 @@ class BLE: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
     }
 
     func startMonitor(uuid: UUID) {
+        DiagnosticLog.event("monitor_start", ["uuid": uuid.uuidString,
+            "previous_uuid": monitoredUUID?.uuidString ?? "", "device_cached": devices[uuid] != nil,
+            "cached_state": devices[uuid]?.peripheral?.state.rawValue ?? -1])
         if let p = monitoredPeripheral {
+            DiagnosticLog.event("cancel_connection", ["uuid": p.identifier.uuidString, "reason": "monitor_selection_changed"])
             centralMgr.cancelPeripheralConnection(p)
         }
         monitoredUUID = uuid
@@ -187,6 +197,9 @@ class BLE: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
     func resetSignalTimer() {
         signalTimer?.invalidate()
         signalTimer = Timer.scheduledTimer(withTimeInterval: signalTimeout, repeats: false, block: { _ in
+            DiagnosticLog.event("signal_timeout", ["uuid": self.monitoredUUID?.uuidString ?? "",
+                "timeout_seconds": self.signalTimeout, "has_peripheral": self.monitoredPeripheral != nil,
+                "last_rssi_read_at": self.lastReadAt])
             print("Device is lost")
             self.delegate?.updateRSSI(rssi: nil, active: false)
             if self.presence {
@@ -200,6 +213,7 @@ class BLE: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
     }
 
     func centralManagerDidUpdateState(_ central: CBCentralManager) {
+        DiagnosticLog.event("central_state", ["state": central.state.rawValue])
         switch central.state {
         case .poweredOn:
             print("Bluetooth powered on")
@@ -233,6 +247,8 @@ class BLE: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
     }
 
     func updateMonitoredPeripheral(_ rssi: Int) {
+        DiagnosticLog.event("monitor_rssi", ["uuid": monitoredUUID?.uuidString ?? "", "rssi": rssi,
+            "active_timer": activeModeTimer != nil, "presence": presence])
         // print(String(format: "rssi: %d", rssi))
         if rssi >= (unlockRSSI == UNLOCK_DISABLED ? lockRSSI : unlockRSSI) && !presence {
             print("Device is close")
@@ -266,8 +282,14 @@ class BLE: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
     func resetScanTimer(device: Device) {
         device.scanTimer?.invalidate()
         device.scanTimer = Timer.scheduledTimer(withTimeInterval: signalTimeout, repeats: false, block: { _ in
+            DiagnosticLog.event("scan_record_expired", ["uuid": device.uuid.uuidString,
+                "is_monitored_uuid": device.uuid == self.monitoredUUID,
+                "is_monitored_peripheral": device.peripheral != nil && device.peripheral == self.monitoredPeripheral,
+                "peripheral_state": device.peripheral?.state.rawValue ?? -1,
+                "active_timer": self.activeModeTimer != nil])
             self.delegate?.removeDevice(device: device)
             if let p = device.peripheral {
+                DiagnosticLog.event("cancel_connection", ["uuid": p.identifier.uuidString, "reason": "scan_record_expired"])
                 self.centralMgr.cancelPeripheralConnection(p)
             }
             self.devices.removeValue(forKey: device.uuid)
@@ -278,7 +300,11 @@ class BLE: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
     }
 
     func connectMonitoredPeripheral() {
-        guard let p = monitoredPeripheral else { return }
+        guard let p = monitoredPeripheral else {
+            DiagnosticLog.event("connect_skipped", ["reason": "no_monitored_peripheral", "uuid": monitoredUUID?.uuidString ?? ""])
+            return
+        }
+        DiagnosticLog.event("monitor_connection_attempt", ["uuid": p.identifier.uuidString, "state": p.state.rawValue])
 
         // Idk why but this works like a charm when 'didConnect' won't get called.
         // However, this generates warnings in the log.
@@ -290,6 +316,7 @@ class BLE: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
         connectionTimer?.invalidate()
         connectionTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: false, block: { _ in
             if p.state == .connecting {
+                DiagnosticLog.event("cancel_connection", ["uuid": p.identifier.uuidString, "reason": "connection_timeout"])
                 print("Connection timeout")
                 self.centralMgr.cancelPeripheralConnection(p)
             }
@@ -305,6 +332,16 @@ class BLE: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
                         rssi RSSI: NSNumber)
     {
         let rssi = RSSI.intValue > 0 ? 0 : RSSI.intValue
+        if DiagnosticLog.watchName != nil {
+            let advertisedName = advertisementData[CBAdvertisementDataLocalNameKey] as? String
+            guard DiagnosticLog.matchesWatch(peripheralName: peripheral.name, advertisedName: advertisedName) else { return }
+        }
+        if peripheral.identifier == monitoredUUID || (peripheral.name ?? "").hasPrefix("OPPO Watch X") {
+            DiagnosticLog.event("advertisement", ["uuid": peripheral.identifier.uuidString,
+                "name": peripheral.name ?? "", "rssi": rssi, "state": peripheral.state.rawValue,
+                "is_monitored_uuid": peripheral.identifier == monitoredUUID,
+                "has_monitored_peripheral": monitoredPeripheral != nil])
+        }
         if let uuid = monitoredUUID {
             if peripheral.identifier.description == uuid.description {
                 if monitoredPeripheral == nil {
@@ -335,14 +372,18 @@ class BLE: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
                 device = Device(uuid: peripheral.identifier)
                 if (rssi >= thresholdRSSI) {
                     device.peripheral = peripheral
+                    device.advertisedName = advertisementData[CBAdvertisementDataLocalNameKey] as? String
                     device.rssi = rssi
                     device.advData = advertisementData["kCBAdvDataManufacturerData"] as? Data
                     devices[peripheral.identifier] = device
+                    DiagnosticLog.event("scan_list_connection_requested", ["uuid": peripheral.identifier.uuidString,
+                        "is_monitored_uuid": peripheral.identifier == monitoredUUID, "passive_mode": passiveMode])
                     central.connect(peripheral, options: nil)
                     delegate?.newDevice(device: device)
                 }
             } else {
                 device = dev!
+                device.advertisedName = advertisementData[CBAdvertisementDataLocalNameKey] as? String ?? device.advertisedName
                 device.rssi = rssi
                 delegate?.updateDevice(device: device)
             }
@@ -353,6 +394,10 @@ class BLE: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
     func centralManager(_ central: CBCentralManager,
                         didConnect peripheral: CBPeripheral)
     {
+        DiagnosticLog.event("peripheral_connected", ["uuid": peripheral.identifier.uuidString,
+            "name": peripheral.name ?? "", "is_monitored_uuid": peripheral.identifier == monitoredUUID,
+            "is_monitored_peripheral": peripheral == monitoredPeripheral,
+            "device_list_open": scanMode, "passive_mode": passiveMode])
         peripheral.delegate = self
         if scanMode {
             peripheral.discoverServices([DeviceInformation])
@@ -366,10 +411,25 @@ class BLE: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
     }
 
     //MARK:CBCentralManagerDelegate end -
+
+    func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
+        DiagnosticLog.event("peripheral_disconnected", ["uuid": peripheral.identifier.uuidString,
+            "is_monitored_uuid": peripheral.identifier == monitoredUUID,
+            "is_monitored_peripheral": peripheral == monitoredPeripheral,
+            "error": error?.localizedDescription ?? "", "active_timer": activeModeTimer != nil])
+    }
+
+    func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
+        DiagnosticLog.event("peripheral_connection_failed", ["uuid": peripheral.identifier.uuidString,
+            "error": error?.localizedDescription ?? ""])
+    }
     
     //MARK:- CBPeripheralDelegate start
 
     func peripheral(_ peripheral: CBPeripheral, didReadRSSI RSSI: NSNumber, error: Error?) {
+        DiagnosticLog.event("peripheral_rssi_callback", ["uuid": peripheral.identifier.uuidString,
+            "rssi": RSSI.intValue, "error": error?.localizedDescription ?? "",
+            "is_monitored_peripheral": peripheral == monitoredPeripheral])
         guard peripheral == monitoredPeripheral else { return }
         let rssi = RSSI.intValue > 0 ? 0 : RSSI.intValue
         //print("readRSSI \(rssi)dBm")
@@ -383,6 +443,7 @@ class BLE: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
             }
             activeModeTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true, block: { _ in
                 if Date().timeIntervalSince1970 > self.lastReadAt + 10 {
+                    DiagnosticLog.event("cancel_connection", ["uuid": peripheral.identifier.uuidString, "reason": "rssi_read_stalled"])
                     print("Falling back to passive mode")
                     self.centralMgr.cancelPeripheralConnection(peripheral)
                     self.activeModeTimer?.invalidate()
@@ -439,6 +500,7 @@ class BLE: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
                         delegate?.updateDevice(device: device)
                     }
                     if device.model != nil && device.model != nil && device.peripheral != monitoredPeripheral {
+                        DiagnosticLog.event("cancel_connection", ["uuid": peripheral.identifier.uuidString, "reason": "device_information_complete"])
                         centralMgr.cancelPeripheralConnection(peripheral)
                     }
                 }
